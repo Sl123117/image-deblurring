@@ -24,7 +24,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler, LinearLR, S
 
 from .data import GoProPairDataset, build_dataloader, build_sequence_split
 from .metrics import AverageMeter, compute_psnr, evaluate_model
-from .models import IdentityDeblurModel, UNetDeblurModel, summarize_model
+from .models import (
+    SUPPORTED_MODEL_NAMES,
+    IdentityDeblurModel,
+    build_deblurring_model,
+    normalize_model_name,
+    resolve_model_artifact_stem,
+    summarize_model,
+)
 from .utils import find_dataset_root
 
 
@@ -48,14 +55,15 @@ class BenchmarkConfig:
     cosine_eta_min: float = 1e-6
     scheduler_step_size: int = 15
     scheduler_gamma: float = 0.5
+    model_name: str = "unet"
     base_channels: int = 16
     use_amp: bool = True
     validate_each_epoch: bool = True
     resume_checkpoint: Optional[str] = None
     checkpoint_monitor: str = "val_psnr"
     checkpoint_name: Optional[str] = None
-    best_checkpoint_name: str = "unet_deblurring_best.pt"
-    latest_checkpoint_name: str = "unet_deblurring_latest.pt"
+    best_checkpoint_name: Optional[str] = None
+    latest_checkpoint_name: Optional[str] = None
     artifact_prefix: Optional[str] = None
     pin_memory: Optional[bool] = None
     persistent_workers: bool = True
@@ -259,6 +267,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: BenchmarkConfig) -
 
 
 def _validate_config(config: BenchmarkConfig) -> None:
+    normalize_model_name(config.model_name)
     if config.num_epochs < 1:
         raise ValueError("num_epochs must be at least 1")
     if config.train_batch_size < 1:
@@ -321,7 +330,16 @@ def _resolve_checkpoint_value(epoch_record: dict[str, Any], monitor_name: str) -
 
 
 def _resolve_best_checkpoint_name(config: BenchmarkConfig) -> str:
-    return config.checkpoint_name or config.best_checkpoint_name
+    return config.checkpoint_name or config.best_checkpoint_name or _default_checkpoint_name(config, "best")
+
+
+def _resolve_latest_checkpoint_name(config: BenchmarkConfig) -> str:
+    return config.latest_checkpoint_name or _default_checkpoint_name(config, "latest")
+
+
+def _default_checkpoint_name(config: BenchmarkConfig, checkpoint_kind: str) -> str:
+    model_stem = resolve_model_artifact_stem(config.model_name)
+    return f"{model_stem}_{checkpoint_kind}.pt"
 
 
 def _artifact_filename(config: BenchmarkConfig, filename: str) -> str:
@@ -355,16 +373,23 @@ def _resolve_resume_checkpoint_path(
     )
 
 
+def _known_checkpoint_suffix_pairs() -> tuple[tuple[str, str], ...]:
+    pairs = []
+    for model_name in SUPPORTED_MODEL_NAMES:
+        model_stem = resolve_model_artifact_stem(model_name)
+        pairs.append((f"_{model_stem}_latest.pt", f"_{model_stem}_best.pt"))
+    return tuple(pairs)
+
+
 def _load_history_from_metrics_artifact(checkpoint_path: Path) -> list[dict[str, Any]]:
     checkpoint_name = checkpoint_path.name
-    suffixes = (
-        "_unet_deblurring_latest.pt",
-        "_unet_deblurring_best.pt",
-    )
     artifact_prefix = None
-    for suffix in suffixes:
-        if checkpoint_name.endswith(suffix):
-            artifact_prefix = checkpoint_name.removesuffix(suffix)
+    for latest_suffix, best_suffix in _known_checkpoint_suffix_pairs():
+        for suffix in (latest_suffix, best_suffix):
+            if checkpoint_name.endswith(suffix):
+                artifact_prefix = checkpoint_name.removesuffix(suffix)
+                break
+        if artifact_prefix is not None:
             break
 
     if artifact_prefix is None:
@@ -383,17 +408,15 @@ def _load_history_from_metrics_artifact(checkpoint_path: Path) -> list[dict[str,
 
 def _resolve_resume_best_checkpoint_path(resume_checkpoint_path: Path) -> Optional[Path]:
     checkpoint_name = resume_checkpoint_path.name
-    latest_suffix = "_unet_deblurring_latest.pt"
-    best_suffix = "_unet_deblurring_best.pt"
-
-    if checkpoint_name.endswith(best_suffix):
-        return resume_checkpoint_path if resume_checkpoint_path.exists() else None
-    if checkpoint_name.endswith(latest_suffix):
-        candidate = resume_checkpoint_path.with_name(
-            checkpoint_name.removesuffix(latest_suffix) + best_suffix
-        )
-        if candidate.exists():
-            return candidate
+    for latest_suffix, best_suffix in _known_checkpoint_suffix_pairs():
+        if checkpoint_name.endswith(best_suffix):
+            return resume_checkpoint_path if resume_checkpoint_path.exists() else None
+        if checkpoint_name.endswith(latest_suffix):
+            candidate = resume_checkpoint_path.with_name(
+                checkpoint_name.removesuffix(latest_suffix) + best_suffix
+            )
+            if candidate.exists():
+                return candidate
     return None
 
 
@@ -437,6 +460,10 @@ def _validate_resume_compatibility(
     checkpoint_recipe = _effective_checkpoint_recipe(checkpoint_config)
     current_recipe = _current_recipe_mapping(config)
     incompatible_fields = []
+    checkpoint_model_name = normalize_model_name(str(checkpoint_config.get("model_name", "unet")))
+    current_model_name = normalize_model_name(config.model_name)
+    if checkpoint_model_name != current_model_name:
+        incompatible_fields.append(("model_name", checkpoint_model_name, current_model_name))
     for field_name in (
         "base_channels",
         "patch_size",
@@ -786,7 +813,7 @@ def run_training(
             "best_metric_at_resume": best_metric,
         }
         print(
-            "Resuming U-Net benchmark from {path} at epoch {epoch}.".format(
+            "Resuming benchmark from {path} at epoch {epoch}.".format(
                 path=resume_info["checkpoint_path"],
                 epoch=start_epoch,
             ),
@@ -902,6 +929,7 @@ def save_comparison_figure(
     split_name: str,
     example: dict[str, Any],
     model: nn.Module,
+    model_label: str,
     identity_model: nn.Module,
     device: torch.device,
     output_path: Path,
@@ -926,7 +954,7 @@ def save_comparison_figure(
     panels = [
         (blur_image, "Blur input"),
         (identity_image, f"Identity\nPSNR {identity_psnr:.2f}"),
-        (model_image, f"U-Net\nPSNR {model_psnr:.2f}"),
+        (model_image, f"{model_label}\nPSNR {model_psnr:.2f}"),
         (sharp_image, "Sharp target"),
     ]
 
@@ -940,7 +968,7 @@ def save_comparison_figure(
     plt.close(figure)
     return {
         "identity_psnr": identity_psnr,
-        "unet_psnr": model_psnr,
+        "model_psnr": model_psnr,
     }
 
 
@@ -954,18 +982,19 @@ def write_benchmark_report(
     split_manifest: dict[str, Any],
     model_summary: dict[str, Any],
     identity_metrics: dict[str, Any],
-    unet_metrics: dict[str, Any],
+    model_metrics: dict[str, Any],
     training_history: list[dict[str, Any]],
 ) -> None:
     train_sequences = ", ".join(split_manifest["train_sequences"])
     val_sequences = ", ".join(split_manifest["val_sequences"])
-    val_psnr_gain = unet_metrics["val"]["psnr"] - identity_metrics["val"]["psnr"]
-    val_ssim_gain = unet_metrics["val"]["ssim"] - identity_metrics["val"]["ssim"]
-    test_psnr_gain = unet_metrics["test"]["psnr"] - identity_metrics["test"]["psnr"]
-    test_ssim_gain = unet_metrics["test"]["ssim"] - identity_metrics["test"]["ssim"]
+    val_psnr_gain = model_metrics["val"]["psnr"] - identity_metrics["val"]["psnr"]
+    val_ssim_gain = model_metrics["val"]["ssim"] - identity_metrics["val"]["ssim"]
+    test_psnr_gain = model_metrics["test"]["psnr"] - identity_metrics["test"]["psnr"]
+    test_ssim_gain = model_metrics["test"]["ssim"] - identity_metrics["test"]["ssim"]
+    model_label = model_summary["name"]
 
     qualitative_lines = [
-        "- The identity baseline is already strong on GoPro, so a plain U-Net baseline needs to clear a fairly high floor."
+        f"- The identity baseline is already strong on GoPro, so the {model_label} benchmark needs to clear a fairly high floor."
     ]
     if test_psnr_gain < 0.05:
         qualitative_lines.append(
@@ -973,11 +1002,11 @@ def write_benchmark_report(
         )
     else:
         qualitative_lines.append(
-            "- The U-Net improves over identity on both validation and test, which confirms that the paired pipeline and restoration model are working end to end."
+            f"- The {model_label} improves over identity on both validation and test, which confirms that the paired pipeline and restoration model are working end to end."
         )
 
     issue_lines = [
-        "- This run uses a modest U-Net baseline, so model capacity and training duration are still conservative.",
+        f"- This run uses a modest {model_label} baseline, so model capacity and training duration are still conservative.",
         "- Validation is derived from only three sequences, so conclusions should be treated as directional rather than final.",
     ]
     if config.validate_each_epoch:
@@ -1035,6 +1064,7 @@ def write_benchmark_report(
         "",
         "## Model",
         "",
+        f"- Model key: `{model_summary['model_name']}`",
         f"- Architecture: `{model_summary['name']}`",
         f"- Trainable parameters: {model_summary['trainable_parameters']:,}",
         f"- Total parameters: {model_summary['total_parameters']:,}",
@@ -1064,8 +1094,8 @@ def write_benchmark_report(
         "",
         f"- Identity validation: PSNR {identity_metrics['val']['psnr']:.4f}, SSIM {identity_metrics['val']['ssim']:.4f}",
         f"- Identity test: PSNR {identity_metrics['test']['psnr']:.4f}, SSIM {identity_metrics['test']['ssim']:.4f}",
-        f"- U-Net validation: PSNR {unet_metrics['val']['psnr']:.4f}, SSIM {unet_metrics['val']['ssim']:.4f}",
-        f"- U-Net test: PSNR {unet_metrics['test']['psnr']:.4f}, SSIM {unet_metrics['test']['ssim']:.4f}",
+        f"- {model_label} validation: PSNR {model_metrics['val']['psnr']:.4f}, SSIM {model_metrics['val']['ssim']:.4f}",
+        f"- {model_label} test: PSNR {model_metrics['test']['psnr']:.4f}, SSIM {model_metrics['test']['ssim']:.4f}",
         f"- Validation improvement over identity: PSNR {val_psnr_gain:+.4f}, SSIM {val_ssim_gain:+.4f}",
         f"- Test improvement over identity: PSNR {test_psnr_gain:+.4f}, SSIM {test_ssim_gain:+.4f}",
         "",
@@ -1111,6 +1141,7 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
             output_dirs=output_dirs,
         )
         config = _maybe_inherit_resume_recipe(config, resume_checkpoint_path)
+    config = replace(config, model_name=normalize_model_name(config.model_name))
 
     _validate_config(config)
     seed_everything(config.seed)
@@ -1193,8 +1224,8 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
 
     loss_fn = build_loss_fn(config)
     identity_model = IdentityDeblurModel().to(device)
-    unet_model = UNetDeblurModel(base_channels=config.base_channels).to(device)
-    summary = summarize_model(unet_model, name="UNetDeblurModel")
+    model = build_deblurring_model(model_name=config.model_name, base_channels=config.base_channels).to(device)
+    summary = summarize_model(model, name=type(model).__name__, model_name=config.model_name)
     write_json(
         output_dirs["metrics"] / _artifact_filename(config, "model_summary.json"),
         asdict(summary),
@@ -1206,10 +1237,10 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
     identity_test_metrics = evaluate_model(identity_model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True)
 
     best_checkpoint_path = output_dirs["checkpoints"] / _resolve_best_checkpoint_name(config)
-    latest_checkpoint_path = output_dirs["checkpoints"] / config.latest_checkpoint_name
-    print("Training U-Net benchmark...", flush=True)
+    latest_checkpoint_path = output_dirs["checkpoints"] / _resolve_latest_checkpoint_name(config)
+    print(f"Training {summary.name} benchmark...", flush=True)
     training_history, best_checkpoint_metric, resume_info = run_training(
-        unet_model,
+        model,
         train_loader,
         val_loader,
         device=device,
@@ -1220,19 +1251,19 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         resume_checkpoint_path=resume_checkpoint_path,
     )
 
-    load_checkpoint(best_checkpoint_path, unet_model, device)
-    print("Evaluating best U-Net on validation split...", flush=True)
-    unet_val_metrics = evaluate_model(unet_model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
-    print("Evaluating best U-Net on test split...", flush=True)
-    unet_test_metrics = evaluate_model(unet_model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+    load_checkpoint(best_checkpoint_path, model, device)
+    print(f"Evaluating best {summary.name} on validation split...", flush=True)
+    model_val_metrics = evaluate_model(model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+    print(f"Evaluating best {summary.name} on test split...", flush=True)
+    model_test_metrics = evaluate_model(model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
 
     comparison_examples = []
-    if unet_val_metrics.get("examples"):
-        comparison_examples.append(("val", unet_val_metrics["examples"][0]))
-        comparison_examples.append(("val", unet_val_metrics["examples"][-1]))
-    if unet_test_metrics.get("examples"):
-        comparison_examples.append(("test", unet_test_metrics["examples"][0]))
-        comparison_examples.append(("test", unet_test_metrics["examples"][-1]))
+    if model_val_metrics.get("examples"):
+        comparison_examples.append(("val", model_val_metrics["examples"][0]))
+        comparison_examples.append(("val", model_val_metrics["examples"][-1]))
+    if model_test_metrics.get("examples"):
+        comparison_examples.append(("test", model_test_metrics["examples"][0]))
+        comparison_examples.append(("test", model_test_metrics["examples"][-1]))
 
     visual_summaries = []
     for split_name, example in comparison_examples:
@@ -1244,7 +1275,8 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         visual_metrics = save_comparison_figure(
             split_name=split_name,
             example=example,
-            model=unet_model,
+            model=model,
+            model_label=summary.name,
             identity_model=identity_model,
             device=device,
             output_path=output_path,
@@ -1270,17 +1302,19 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
             "val": identity_val_metrics,
             "test": identity_test_metrics,
         },
-        "unet": {
+        "model": {
             "best_checkpoint_metric": best_checkpoint_metric,
             "best_checkpoint_path": str(best_checkpoint_path),
             "latest_checkpoint_path": str(latest_checkpoint_path),
-            "val": unet_val_metrics,
-            "test": unet_test_metrics,
+            "val": model_val_metrics,
+            "test": model_test_metrics,
         },
         "training_history": training_history,
         "training_timing_summary": summarize_training_timing(training_history),
         "visual_comparisons": visual_summaries,
     }
+    if config.model_name == "unet":
+        metrics_payload["unet"] = metrics_payload["model"]
     write_json(
         output_dirs["metrics"] / _artifact_filename(config, "benchmark_metrics.json"),
         metrics_payload,
@@ -1294,12 +1328,17 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         split_manifest=split_manifest,
         model_summary=asdict(summary),
         identity_metrics={"val": identity_val_metrics, "test": identity_test_metrics},
-        unet_metrics={"val": unet_val_metrics, "test": unet_test_metrics},
+        model_metrics={"val": model_val_metrics, "test": model_test_metrics},
         training_history=training_history,
     )
 
     print("Identity val/test:", _metric_value(identity_val_metrics, "psnr"), _metric_value(identity_test_metrics, "psnr"), flush=True)
-    print("UNet val/test:", _metric_value(unet_val_metrics, "psnr"), _metric_value(unet_test_metrics, "psnr"), flush=True)
+    print(
+        f"{summary.name} val/test:",
+        _metric_value(model_val_metrics, "psnr"),
+        _metric_value(model_test_metrics, "psnr"),
+        flush=True,
+    )
     print("Best checkpoint:", best_checkpoint_path, flush=True)
     print("Latest checkpoint:", latest_checkpoint_path, flush=True)
     return metrics_payload

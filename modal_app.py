@@ -50,18 +50,23 @@ def _build_benchmark_config(
     eval_batch_size: int,
     num_workers: int,
     base_channels: int,
+    model_name: str,
     resume_checkpoint: str,
 ):
     from src.benchmark import BenchmarkConfig
+    from src.models import normalize_model_name, resolve_model_artifact_stem
 
     normalized_profile = profile.lower()
+    normalized_model_name = normalize_model_name(model_name)
     checkpoint_prefix = _slugify(run_name)
+    model_artifact_stem = resolve_model_artifact_stem(normalized_model_name)
     report_name = f"{checkpoint_prefix}_{normalized_profile}_benchmark_report.md"
-    best_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_unet_deblurring_best.pt"
-    latest_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_unet_deblurring_latest.pt"
+    best_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_{model_artifact_stem}_best.pt"
+    latest_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_{model_artifact_stem}_latest.pt"
 
     config = BenchmarkConfig(
         dataset_root="data/raw/GOPRO_Large",
+        model_name=normalized_model_name,
         artifact_prefix=checkpoint_prefix,
         report_name=report_name,
         best_checkpoint_name=best_checkpoint_name,
@@ -109,7 +114,7 @@ def _build_benchmark_config(
     return config
 
 
-def _run_smoke_check() -> dict[str, Any]:
+def _run_smoke_check(*, model_name: str = "unet", base_channels: int = 16) -> dict[str, Any]:
     import torch
     from torch.optim import Adam
     from torch.utils.data import Subset
@@ -124,19 +129,21 @@ def _run_smoke_check() -> dict[str, Any]:
     )
     from src.data import GoProPairDataset, build_dataloader, build_sequence_split
     from src.metrics import evaluate_model
-    from src.models import UNetDeblurModel
+    from src.models import build_deblurring_model, normalize_model_name, summarize_model
 
     os.chdir(PROJECT_ROOT)
     seed_everything(42)
+    normalized_model_name = normalize_model_name(model_name)
 
     config = BenchmarkConfig(
         dataset_root="data/raw/GOPRO_Large",
+        model_name=normalized_model_name,
         num_epochs=1,
         train_batch_size=2,
         eval_batch_size=1,
         num_workers=2,
         cpu_num_threads=2,
-        base_channels=16,
+        base_channels=base_channels,
         use_amp=True,
         validate_each_epoch=True,
         checkpoint_monitor="val_psnr",
@@ -185,7 +192,8 @@ def _run_smoke_check() -> dict[str, Any]:
         prefetch_factor=runtime["prefetch_factor"],
     )
 
-    model = UNetDeblurModel(base_channels=config.base_channels).to(device)
+    model = build_deblurring_model(model_name=config.model_name, base_channels=config.base_channels).to(device)
+    summary = summarize_model(model, name=type(model).__name__, model_name=config.model_name)
     optimizer = Adam(model.parameters(), lr=config.learning_rate)
     loss_fn = build_loss_fn(config)
     scaler = torch.amp.GradScaler(device="cuda", enabled=runtime["amp_enabled"])
@@ -212,6 +220,8 @@ def _run_smoke_check() -> dict[str, Any]:
     return {
         "profile": "smoke",
         "device": device.type,
+        "model_name": config.model_name,
+        "model_summary": summary.__dict__,
         "runtime": runtime,
         "split_manifest": {
             "seed": split.seed,
@@ -248,6 +258,7 @@ def run_benchmark_remote(
     eval_batch_size: int = 0,
     num_workers: int = -1,
     base_channels: int = 0,
+    model_name: str = "unet",
     resume_checkpoint: str = "",
 ) -> dict[str, Any]:
     from src.benchmark import run_benchmark
@@ -264,6 +275,7 @@ def run_benchmark_remote(
         eval_batch_size=eval_batch_size,
         num_workers=num_workers,
         base_channels=base_channels,
+        model_name=model_name,
         resume_checkpoint=resume_checkpoint,
     )
 
@@ -273,14 +285,15 @@ def run_benchmark_remote(
     return {
         "profile": profile,
         "run_name": run_name,
+        "model_name": metrics["config"]["model_name"],
         "device": metrics["device"],
         "runtime": metrics["runtime"],
         "resume": metrics["resume"],
         "report_path": f"{RESULTS_ROOT}/metrics/{config.report_name}",
-        "best_checkpoint_path": metrics["unet"]["best_checkpoint_path"],
-        "latest_checkpoint_path": metrics["unet"]["latest_checkpoint_path"],
-        "val_psnr": metrics["unet"]["val"]["psnr"],
-        "test_psnr": metrics["unet"]["test"]["psnr"],
+        "best_checkpoint_path": metrics["model"]["best_checkpoint_path"],
+        "latest_checkpoint_path": metrics["model"]["latest_checkpoint_path"],
+        "val_psnr": metrics["model"]["val"]["psnr"],
+        "test_psnr": metrics["model"]["test"]["psnr"],
     }
 
 
@@ -297,12 +310,12 @@ def run_benchmark_remote(
         RESULTS_ROOT: results_volume,
     },
 )
-def run_smoke_remote() -> dict[str, Any]:
+def run_smoke_remote(model_name: str = "unet", base_channels: int = 16) -> dict[str, Any]:
     os.chdir(PROJECT_ROOT)
     os.makedirs(f"{DATA_ROOT}/GOPRO_Large", exist_ok=True)
     os.makedirs(RESULTS_ROOT, exist_ok=True)
 
-    smoke_result = _run_smoke_check()
+    smoke_result = _run_smoke_check(model_name=model_name, base_channels=base_channels)
     return smoke_result
 
 
@@ -315,11 +328,13 @@ def main(
     eval_batch_size: int = 0,
     num_workers: int = -1,
     base_channels: int = 0,
+    model_name: str = "unet",
     resume_checkpoint: str = "",
 ) -> None:
     normalized_profile = profile.lower()
     if normalized_profile == "smoke":
-        result = run_smoke_remote.remote()
+        smoke_base_channels = base_channels if base_channels > 0 else 16
+        result = run_smoke_remote.remote(model_name=model_name, base_channels=smoke_base_channels)
     else:
         result = run_benchmark_remote.remote(
             profile=profile,
@@ -329,6 +344,7 @@ def main(
             eval_batch_size=eval_batch_size,
             num_workers=num_workers,
             base_channels=base_channels,
+            model_name=model_name,
             resume_checkpoint=resume_checkpoint,
         )
     print(json.dumps(result, indent=2))
