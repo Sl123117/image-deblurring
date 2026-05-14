@@ -1,0 +1,5 @@
+matplotlib==3.9.4
+modal==1.2.6
+numpy==2.0.2
+Pillow==11.3.0
+torch==2.8.0

@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local scratch space
+.venv/
+venv/
+env/
+.pycache_tmp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local datasets and processed artifacts
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Generated checkpoints and downloaded Modal results
+results/checkpoints/*
+!results/checkpoints/.gitkeep
+results/modal-download/
