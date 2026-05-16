@@ -21,6 +21,7 @@ image-deblurring/
 └── src/
     ├── __init__.py
     ├── data.py
+    ├── models.py
     ├── transforms.py
     └── utils.py
 ```
@@ -97,6 +98,7 @@ Run a remote smoke test first. This checks the dataset mount, CUDA path, one tin
 
 Run the benchmark wrapper later. The `benchmark` profile now defaults to a first serious L4 configuration:
 
+- `model_name="unet"`
 - `60` epochs
 - `base_channels=32`
 - `Charbonnier(eps=1e-3)` loss
@@ -118,6 +120,25 @@ Override any of those defaults if needed:
 .venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-charb-cosine-20260511-02 --epochs 60 --train-batch-size 8 --eval-batch-size 2 --num-workers 6 --base-channels 32
 ```
 
+Run the custom motion-aware architecture by selecting `motion_routed_unet` explicitly. This keeps the training recipe fixed while swapping only the restoration model:
+
+```bash
+.venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-motion-routed-20260513-01 --model-name motion_routed_unet --epochs 60 --base-channels 32
+```
+
+Run the custom NAF-style architecture by selecting `naf_style_unet` explicitly. This is a block-swap benchmark that keeps the dataset split, crop size, loss, schedule, and epoch count fixed:
+
+```bash
+.venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-naf-style-20260514-01 --model-name naf_style_unet --epochs 60 --base-channels 32
+```
+
+For the first `naf_style_unet` benchmark, stop the live run early if validation PSNR falls behind the locked baseline by more than the agreed margin:
+
+- epoch `12`: stop if val PSNR is below `24.17`
+- epoch `24`: stop if val PSNR is below `24.31`
+- epoch `36`: stop if val PSNR is below `24.44`
+- epoch `48`: stop if val PSNR is below `24.55`
+
 Resume from a saved training checkpoint by pointing at the prior `latest` checkpoint. When resuming, `--epochs` is the total target epoch count, not the number of extra epochs:
 
 ```bash
@@ -125,6 +146,7 @@ Resume from a saved training checkpoint by pointing at the prior `latest` checkp
 ```
 
 If the resume checkpoint comes from an older `L1 + StepLR` run, the benchmark will automatically inherit that legacy recipe so the checkpoint remains compatible.
+Checkpoint resume is model-specific: a `unet` checkpoint can only resume into `--model-name unet`, a motion-routed checkpoint can only resume into `--model-name motion_routed_unet`, and a NAF-style checkpoint can only resume into `--model-name naf_style_unet`.
 
 Download results from the results volume:
 
