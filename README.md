@@ -98,7 +98,7 @@ Run a remote smoke test first. This checks the dataset mount, CUDA path, one tin
 
 Run the benchmark wrapper later. The `benchmark` profile now defaults to a first serious L4 configuration:
 
-- `model_name="unet"`
+- `model_name="naf_style_unet"`
 - `60` epochs
 - `base_channels=32`
 - `Charbonnier(eps=1e-3)` loss
@@ -111,7 +111,7 @@ Run the benchmark wrapper later. The `benchmark` profile now defaults to a first
 All benchmark artifacts are namespaced by `run_name`, so repeated Modal runs do not overwrite each other.
 
 ```bash
-.venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-charb-cosine-20260511-01
+.venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-naf-style-default
 ```
 
 Override any of those defaults if needed:
@@ -132,12 +132,25 @@ Run the custom NAF-style architecture by selecting `naf_style_unet` explicitly. 
 .venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-naf-style-20260514-01 --model-name naf_style_unet --epochs 60 --base-channels 32
 ```
 
+Run the published-family comparator by selecting `nafnet_lite_baseline` explicitly. This keeps the benchmark recipe fixed while swapping to a resource-matched NAFNet-lite implementation:
+
+```bash
+.venv/bin/python -m modal run modal_app.py --profile benchmark --run-name l4-nafnet-lite-20260516-01 --model-name nafnet_lite_baseline
+```
+
 For the first `naf_style_unet` benchmark, stop the live run early if validation PSNR falls behind the locked baseline by more than the agreed margin:
 
 - epoch `12`: stop if val PSNR is below `24.17`
 - epoch `24`: stop if val PSNR is below `24.31`
 - epoch `36`: stop if val PSNR is below `24.44`
 - epoch `48`: stop if val PSNR is below `24.55`
+
+For the first `nafnet_lite_baseline` benchmark, use the stronger `l4-naf-style-20260514-01` run as the matched-epoch reference. Treat epoch `12` as advisory only, then stop if validation PSNR falls materially behind:
+
+- epoch `12`: advisory only; stop only if val PSNR is below `24.05`
+- epoch `24`: stop if val PSNR is below `24.52`
+- epoch `36`: stop if val PSNR is below `25.01`
+- epoch `48`: stop if val PSNR is below `25.28`
 
 Resume from a saved training checkpoint by pointing at the prior `latest` checkpoint. When resuming, `--epochs` is the total target epoch count, not the number of extra epochs:
 
@@ -146,7 +159,13 @@ Resume from a saved training checkpoint by pointing at the prior `latest` checkp
 ```
 
 If the resume checkpoint comes from an older `L1 + StepLR` run, the benchmark will automatically inherit that legacy recipe so the checkpoint remains compatible.
-Checkpoint resume is model-specific: a `unet` checkpoint can only resume into `--model-name unet`, a motion-routed checkpoint can only resume into `--model-name motion_routed_unet`, and a NAF-style checkpoint can only resume into `--model-name naf_style_unet`.
+Checkpoint resume is model-specific: a `unet` checkpoint can only resume into `--model-name unet`, a motion-routed checkpoint can only resume into `--model-name motion_routed_unet`, a NAF-style checkpoint can only resume into `--model-name naf_style_unet`, and a published comparator checkpoint can only resume into `--model-name nafnet_lite_baseline`.
+
+If a run is stopped after training has already produced checkpoints, you can still run the normal final evaluation/report-writing path remotely without retraining:
+
+```bash
+.venv/bin/python -m modal run modal_app.py --profile posthoc-eval --checkpoint-path results/checkpoints/l4-nafnet-lite-continue-20260517-01_benchmark_nafnet_lite_baseline_deblurring_latest.pt
+```
 
 Download results from the results volume:
 

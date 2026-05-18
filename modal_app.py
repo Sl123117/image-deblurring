@@ -45,6 +45,7 @@ def _build_benchmark_config(
     *,
     profile: str,
     run_name: str,
+    model_name: str,
     epochs: int,
     train_batch_size: int,
     eval_batch_size: int,
@@ -53,15 +54,22 @@ def _build_benchmark_config(
     resume_checkpoint: str,
 ):
     from src.benchmark import BenchmarkConfig
+    from src.models import normalize_model_name, resolve_model_artifact_stem
 
     normalized_profile = profile.lower()
+    normalized_model_name = normalize_model_name(model_name)
     checkpoint_prefix = _slugify(run_name)
+    artifact_stem = resolve_model_artifact_stem(normalized_model_name)
     report_name = f"{checkpoint_prefix}_{normalized_profile}_benchmark_report.md"
-    best_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_unet_deblurring_best.pt"
-    latest_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_unet_deblurring_latest.pt"
+    best_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_{artifact_stem}_best.pt"
+    latest_checkpoint_name = f"{checkpoint_prefix}_{normalized_profile}_{artifact_stem}_latest.pt"
+
+    default_base_channels = 22 if normalized_model_name == "nafnet_lite_baseline" else 32
+    smoke_base_channels = 22 if normalized_model_name == "nafnet_lite_baseline" else 16
 
     config = BenchmarkConfig(
         dataset_root="data/raw/GOPRO_Large",
+        model_name=normalized_model_name,
         artifact_prefix=checkpoint_prefix,
         report_name=report_name,
         best_checkpoint_name=best_checkpoint_name,
@@ -77,7 +85,7 @@ def _build_benchmark_config(
             eval_batch_size=1,
             num_workers=2,
             cpu_num_threads=2,
-            base_channels=16,
+            base_channels=smoke_base_channels,
         )
     elif normalized_profile in {"benchmark", "default"}:
         config = replace(
@@ -87,7 +95,7 @@ def _build_benchmark_config(
             eval_batch_size=4,
             num_workers=4,
             cpu_num_threads=4,
-            base_channels=32,
+            base_channels=default_base_channels,
         )
     else:
         raise ValueError("profile must be one of {'smoke', 'benchmark', 'default'}")
@@ -109,7 +117,7 @@ def _build_benchmark_config(
     return config
 
 
-def _run_smoke_check() -> dict[str, Any]:
+def _run_smoke_check(*, model_name: str, base_channels: int = 0) -> dict[str, Any]:
     import torch
     from torch.optim import Adam
     from torch.utils.data import Subset
@@ -124,19 +132,23 @@ def _run_smoke_check() -> dict[str, Any]:
     )
     from src.data import GoProPairDataset, build_dataloader, build_sequence_split
     from src.metrics import evaluate_model
-    from src.models import UNetDeblurModel
+    from src.models import build_deblurring_model, normalize_model_name, summarize_model
 
     os.chdir(PROJECT_ROOT)
     seed_everything(42)
 
+    normalized_model_name = normalize_model_name(model_name)
+    resolved_base_channels = base_channels if base_channels > 0 else (22 if normalized_model_name == "nafnet_lite_baseline" else 16)
+
     config = BenchmarkConfig(
         dataset_root="data/raw/GOPRO_Large",
+        model_name=normalized_model_name,
         num_epochs=1,
         train_batch_size=2,
         eval_batch_size=1,
         num_workers=2,
         cpu_num_threads=2,
-        base_channels=16,
+        base_channels=resolved_base_channels,
         use_amp=True,
         validate_each_epoch=True,
         checkpoint_monitor="val_psnr",
@@ -185,7 +197,8 @@ def _run_smoke_check() -> dict[str, Any]:
         prefetch_factor=runtime["prefetch_factor"],
     )
 
-    model = UNetDeblurModel(base_channels=config.base_channels).to(device)
+    model = build_deblurring_model(model_name=config.model_name, base_channels=config.base_channels).to(device)
+    summary = summarize_model(model, name=model.__class__.__name__, model_name=config.model_name)
     optimizer = Adam(model.parameters(), lr=config.learning_rate)
     loss_fn = build_loss_fn(config)
     scaler = torch.amp.GradScaler(device="cuda", enabled=runtime["amp_enabled"])
@@ -211,6 +224,12 @@ def _run_smoke_check() -> dict[str, Any]:
 
     return {
         "profile": "smoke",
+        "model_name": config.model_name,
+        "model_summary": {
+            "name": summary.name,
+            "trainable_parameters": summary.trainable_parameters,
+            "total_parameters": summary.total_parameters,
+        },
         "device": device.type,
         "runtime": runtime,
         "split_manifest": {
@@ -243,6 +262,7 @@ def _run_smoke_check() -> dict[str, Any]:
 def run_benchmark_remote(
     profile: str = "smoke",
     run_name: str = "modal",
+    model_name: str = "naf_style_unet",
     epochs: int = 0,
     train_batch_size: int = 0,
     eval_batch_size: int = 0,
@@ -259,6 +279,7 @@ def run_benchmark_remote(
     config = _build_benchmark_config(
         profile=profile,
         run_name=run_name,
+        model_name=model_name,
         epochs=epochs,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
@@ -273,14 +294,15 @@ def run_benchmark_remote(
     return {
         "profile": profile,
         "run_name": run_name,
+        "model_name": config.model_name,
         "device": metrics["device"],
         "runtime": metrics["runtime"],
         "resume": metrics["resume"],
         "report_path": f"{RESULTS_ROOT}/metrics/{config.report_name}",
-        "best_checkpoint_path": metrics["unet"]["best_checkpoint_path"],
-        "latest_checkpoint_path": metrics["unet"]["latest_checkpoint_path"],
-        "val_psnr": metrics["unet"]["val"]["psnr"],
-        "test_psnr": metrics["unet"]["test"]["psnr"],
+        "best_checkpoint_path": metrics["model"]["best_checkpoint_path"],
+        "latest_checkpoint_path": metrics["model"]["latest_checkpoint_path"],
+        "val_psnr": metrics["model"]["val"]["psnr"],
+        "test_psnr": metrics["model"]["test"]["psnr"],
     }
 
 
@@ -297,33 +319,81 @@ def run_benchmark_remote(
         RESULTS_ROOT: results_volume,
     },
 )
-def run_smoke_remote() -> dict[str, Any]:
+def run_smoke_remote(
+    model_name: str = "naf_style_unet",
+    base_channels: int = 0,
+) -> dict[str, Any]:
     os.chdir(PROJECT_ROOT)
     os.makedirs(f"{DATA_ROOT}/GOPRO_Large", exist_ok=True)
     os.makedirs(RESULTS_ROOT, exist_ok=True)
 
-    smoke_result = _run_smoke_check()
+    smoke_result = _run_smoke_check(model_name=model_name, base_channels=base_channels)
     return smoke_result
+
+
+@app.function(
+    image=image,
+    gpu="L4",
+    cpu=4,
+    memory=16384,
+    timeout=60 * 60 * 2,
+    startup_timeout=60 * 20,
+    include_source=False,
+    volumes={
+        DATA_ROOT: data_volume,
+        RESULTS_ROOT: results_volume,
+    },
+)
+def run_posthoc_evaluation_remote(checkpoint_path: str) -> dict[str, Any]:
+    from src.benchmark import run_posthoc_evaluation
+
+    os.chdir(PROJECT_ROOT)
+    os.makedirs(f"{DATA_ROOT}/GOPRO_Large", exist_ok=True)
+    os.makedirs(RESULTS_ROOT, exist_ok=True)
+
+    metrics = run_posthoc_evaluation(checkpoint_path)
+    results_volume.commit()
+
+    return {
+        "checkpoint_path": checkpoint_path,
+        "model_name": metrics["config"]["model_name"],
+        "device": metrics["device"],
+        "report_path": f"{RESULTS_ROOT}/metrics/{metrics['config']['report_name']}",
+        "metrics_path": f"{RESULTS_ROOT}/metrics/{metrics['config']['artifact_prefix']}_benchmark_metrics.json"
+        if metrics["config"].get("artifact_prefix")
+        else f"{RESULTS_ROOT}/metrics/benchmark_metrics.json",
+        "best_checkpoint_path": metrics["model"]["best_checkpoint_path"],
+        "latest_checkpoint_path": metrics["model"]["latest_checkpoint_path"],
+        "val_psnr": metrics["model"]["val"]["psnr"],
+        "test_psnr": metrics["model"]["test"]["psnr"],
+    }
 
 
 @app.local_entrypoint()
 def main(
     profile: str = "smoke",
     run_name: str = "modal",
+    model_name: str = "naf_style_unet",
     epochs: int = 0,
     train_batch_size: int = 0,
     eval_batch_size: int = 0,
     num_workers: int = -1,
     base_channels: int = 0,
     resume_checkpoint: str = "",
+    checkpoint_path: str = "",
 ) -> None:
     normalized_profile = profile.lower()
     if normalized_profile == "smoke":
-        result = run_smoke_remote.remote()
+        result = run_smoke_remote.remote(model_name=model_name, base_channels=base_channels)
+    elif normalized_profile in {"posthoc-eval", "posthoc_eval", "checkpoint-eval", "checkpoint_eval"}:
+        if not checkpoint_path:
+            raise ValueError("checkpoint_path is required for posthoc evaluation profiles")
+        result = run_posthoc_evaluation_remote.remote(checkpoint_path=checkpoint_path)
     else:
         result = run_benchmark_remote.remote(
             profile=profile,
             run_name=run_name,
+            model_name=model_name,
             epochs=epochs,
             train_batch_size=train_batch_size,
             eval_batch_size=eval_batch_size,

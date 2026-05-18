@@ -24,7 +24,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler, LinearLR, S
 
 from .data import GoProPairDataset, build_dataloader, build_sequence_split
 from .metrics import AverageMeter, compute_psnr, evaluate_model
-from .models import IdentityDeblurModel, UNetDeblurModel, summarize_model
+from .models import (
+    IdentityDeblurModel,
+    build_deblurring_model,
+    normalize_model_name,
+    resolve_model_artifact_stem,
+    resolve_model_display_name,
+    summarize_model,
+)
 from .utils import find_dataset_root
 
 
@@ -48,14 +55,15 @@ class BenchmarkConfig:
     cosine_eta_min: float = 1e-6
     scheduler_step_size: int = 15
     scheduler_gamma: float = 0.5
+    model_name: str = "naf_style_unet"
     base_channels: int = 16
     use_amp: bool = True
     validate_each_epoch: bool = True
     resume_checkpoint: Optional[str] = None
     checkpoint_monitor: str = "val_psnr"
     checkpoint_name: Optional[str] = None
-    best_checkpoint_name: str = "unet_deblurring_best.pt"
-    latest_checkpoint_name: str = "unet_deblurring_latest.pt"
+    best_checkpoint_name: str = "naf_style_unet_deblurring_best.pt"
+    latest_checkpoint_name: str = "naf_style_unet_deblurring_latest.pt"
     artifact_prefix: Optional[str] = None
     pin_memory: Optional[bool] = None
     persistent_workers: bool = True
@@ -78,6 +86,58 @@ RECIPE_CONFIG_FIELDS = (
     "scheduler_step_size",
     "scheduler_gamma",
 )
+
+
+def _checkpoint_suffixes() -> tuple[str, ...]:
+    suffixes: list[str] = []
+    for artifact_stem in dict.fromkeys(resolve_model_artifact_stem(name) for name in ("unet", "motion_routed_unet", "naf_style_unet", "nafnet_lite_baseline")):
+        suffixes.append(f"_{artifact_stem}_latest.pt")
+        suffixes.append(f"_{artifact_stem}_best.pt")
+    return tuple(suffixes)
+
+
+def _checkpoint_stem_from_name(checkpoint_name: str) -> Optional[str]:
+    for artifact_stem in dict.fromkeys(resolve_model_artifact_stem(name) for name in ("unet", "motion_routed_unet", "naf_style_unet", "nafnet_lite_baseline")):
+        for checkpoint_kind in ("latest", "best"):
+            suffix = f"_{artifact_stem}_{checkpoint_kind}.pt"
+            if checkpoint_name.endswith(suffix):
+                return artifact_stem
+    return None
+
+
+def _checkpoint_prefix_from_name(checkpoint_name: str) -> Optional[str]:
+    artifact_stem = _checkpoint_stem_from_name(checkpoint_name)
+    if artifact_stem is None:
+        return None
+    for checkpoint_kind in ("latest", "best"):
+        suffix = f"_{artifact_stem}_{checkpoint_kind}.pt"
+        if checkpoint_name.endswith(suffix):
+            return checkpoint_name.removesuffix(suffix)
+    return None
+
+
+def _normalize_checkpoint_model_name(checkpoint_config: Optional[dict[str, Any]]) -> str:
+    if not isinstance(checkpoint_config, dict):
+        return "unet"
+    return normalize_model_name(str(checkpoint_config.get("model_name", "unet")))
+
+
+def _resolve_resume_latest_checkpoint_path(resume_checkpoint_path: Path) -> Optional[Path]:
+    checkpoint_name = resume_checkpoint_path.name
+    artifact_stem = _checkpoint_stem_from_name(checkpoint_name)
+    if artifact_stem is None:
+        return None
+
+    latest_suffix = f"_{artifact_stem}_latest.pt"
+    best_suffix = f"_{artifact_stem}_best.pt"
+
+    if checkpoint_name.endswith(latest_suffix):
+        return resume_checkpoint_path if resume_checkpoint_path.exists() else None
+    if checkpoint_name.endswith(best_suffix):
+        candidate = resume_checkpoint_path.with_name(checkpoint_name.removesuffix(best_suffix) + latest_suffix)
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class CharbonnierLoss(nn.Module):
@@ -259,6 +319,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: BenchmarkConfig) -
 
 
 def _validate_config(config: BenchmarkConfig) -> None:
+    normalize_model_name(config.model_name)
     if config.num_epochs < 1:
         raise ValueError("num_epochs must be at least 1")
     if config.train_batch_size < 1:
@@ -267,6 +328,8 @@ def _validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("eval_batch_size must be at least 1")
     if config.num_workers < 0:
         raise ValueError("num_workers must be non-negative")
+    if config.base_channels < 1:
+        raise ValueError("base_channels must be at least 1")
     if config.prefetch_factor < 1:
         raise ValueError("prefetch_factor must be at least 1")
     loss_name = _normalize_loss_name(config.loss_name)
@@ -357,12 +420,8 @@ def _resolve_resume_checkpoint_path(
 
 def _load_history_from_metrics_artifact(checkpoint_path: Path) -> list[dict[str, Any]]:
     checkpoint_name = checkpoint_path.name
-    suffixes = (
-        "_unet_deblurring_latest.pt",
-        "_unet_deblurring_best.pt",
-    )
     artifact_prefix = None
-    for suffix in suffixes:
+    for suffix in _checkpoint_suffixes():
         if checkpoint_name.endswith(suffix):
             artifact_prefix = checkpoint_name.removesuffix(suffix)
             break
@@ -383,15 +442,17 @@ def _load_history_from_metrics_artifact(checkpoint_path: Path) -> list[dict[str,
 
 def _resolve_resume_best_checkpoint_path(resume_checkpoint_path: Path) -> Optional[Path]:
     checkpoint_name = resume_checkpoint_path.name
-    latest_suffix = "_unet_deblurring_latest.pt"
-    best_suffix = "_unet_deblurring_best.pt"
+    artifact_stem = _checkpoint_stem_from_name(checkpoint_name)
+    if artifact_stem is None:
+        return None
+
+    latest_suffix = f"_{artifact_stem}_latest.pt"
+    best_suffix = f"_{artifact_stem}_best.pt"
 
     if checkpoint_name.endswith(best_suffix):
         return resume_checkpoint_path if resume_checkpoint_path.exists() else None
     if checkpoint_name.endswith(latest_suffix):
-        candidate = resume_checkpoint_path.with_name(
-            checkpoint_name.removesuffix(latest_suffix) + best_suffix
-        )
+        candidate = resume_checkpoint_path.with_name(checkpoint_name.removesuffix(latest_suffix) + best_suffix)
         if candidate.exists():
             return candidate
     return None
@@ -406,18 +467,59 @@ def _checkpoint_recipe_defaults(checkpoint_path: Path) -> Optional[dict[str, Any
 
 
 def _maybe_inherit_resume_recipe(config: BenchmarkConfig, resume_checkpoint_path: Path) -> BenchmarkConfig:
-    checkpoint_recipe = _checkpoint_recipe_defaults(resume_checkpoint_path)
+    checkpoint = torch.load(resume_checkpoint_path, map_location="cpu")
+    checkpoint_config = checkpoint.get("config")
+    checkpoint_recipe = _effective_checkpoint_recipe(checkpoint_config)
     if checkpoint_recipe is None:
         return config
 
     current_recipe = _current_recipe_mapping(config)
     default_recipe = _current_recipe_mapping(BenchmarkConfig())
-    if current_recipe != default_recipe:
-        return config
+    inherited_updates: dict[str, Any] = {}
 
-    if checkpoint_recipe == current_recipe:
-        return config
-    return replace(config, **checkpoint_recipe)
+    if config.model_name == BenchmarkConfig().model_name:
+        checkpoint_model_name = _normalize_checkpoint_model_name(checkpoint_config)
+        if checkpoint_model_name != normalize_model_name(config.model_name):
+            inherited_updates["model_name"] = checkpoint_model_name
+
+    if current_recipe == default_recipe and checkpoint_recipe != current_recipe:
+        inherited_updates.update(checkpoint_recipe)
+
+    if inherited_updates:
+        return replace(config, **inherited_updates)
+    return config
+
+
+def _build_config_from_checkpoint(
+    checkpoint_config: Optional[dict[str, Any]],
+    *,
+    checkpoint_path: Path,
+) -> BenchmarkConfig:
+    values = dict(checkpoint_config or {})
+    field_names = set(BenchmarkConfig.__dataclass_fields__)
+    filtered_values = {key: value for key, value in values.items() if key in field_names}
+    filtered_values["model_name"] = _normalize_checkpoint_model_name(checkpoint_config)
+
+    artifact_prefix = _checkpoint_prefix_from_name(checkpoint_path.name)
+    if artifact_prefix is not None:
+        filtered_values.setdefault("artifact_prefix", artifact_prefix)
+        filtered_values.setdefault("report_name", f"{artifact_prefix}_benchmark_report.md")
+
+    config = replace(BenchmarkConfig(), **filtered_values)
+
+    best_checkpoint_name = checkpoint_path.name
+    latest_checkpoint_path = _resolve_resume_latest_checkpoint_path(checkpoint_path)
+    if latest_checkpoint_path is not None:
+        config = replace(config, latest_checkpoint_name=latest_checkpoint_path.name)
+    else:
+        config = replace(config, latest_checkpoint_name=best_checkpoint_name)
+
+    best_checkpoint_path = _resolve_resume_best_checkpoint_path(checkpoint_path)
+    if best_checkpoint_path is not None:
+        config = replace(config, best_checkpoint_name=best_checkpoint_path.name, checkpoint_name=best_checkpoint_path.name)
+    else:
+        config = replace(config, best_checkpoint_name=best_checkpoint_name, checkpoint_name=best_checkpoint_name)
+    return config
 
 
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -431,12 +533,14 @@ def _validate_resume_compatibility(
     checkpoint_config: Optional[dict[str, Any]],
     config: BenchmarkConfig,
 ) -> None:
-    if not checkpoint_config:
-        return
-
+    checkpoint_config = checkpoint_config or {}
     checkpoint_recipe = _effective_checkpoint_recipe(checkpoint_config)
     current_recipe = _current_recipe_mapping(config)
     incompatible_fields = []
+    checkpoint_model_name = _normalize_checkpoint_model_name(checkpoint_config)
+    current_model_name = normalize_model_name(config.model_name)
+    if checkpoint_model_name != current_model_name:
+        incompatible_fields.append(("model_name", checkpoint_model_name, current_model_name))
     for field_name in (
         "base_channels",
         "patch_size",
@@ -725,6 +829,7 @@ def run_training(
     optimizer = Adam(model.parameters(), lr=config.learning_rate)
     scheduler = build_scheduler(optimizer, config)
     scaler = torch.amp.GradScaler(device="cuda", enabled=runtime_settings["amp_enabled"])
+    model_label = resolve_model_display_name(config.model_name)
 
     history: list[dict[str, Any]] = []
     monitor_name = config.checkpoint_monitor
@@ -786,7 +891,8 @@ def run_training(
             "best_metric_at_resume": best_metric,
         }
         print(
-            "Resuming U-Net benchmark from {path} at epoch {epoch}.".format(
+            "Resuming {model} benchmark from {path} at epoch {epoch}.".format(
+                model=model_label,
                 path=resume_info["checkpoint_path"],
                 epoch=start_epoch,
             ),
@@ -902,6 +1008,7 @@ def save_comparison_figure(
     split_name: str,
     example: dict[str, Any],
     model: nn.Module,
+    model_label: str,
     identity_model: nn.Module,
     device: torch.device,
     output_path: Path,
@@ -926,7 +1033,7 @@ def save_comparison_figure(
     panels = [
         (blur_image, "Blur input"),
         (identity_image, f"Identity\nPSNR {identity_psnr:.2f}"),
-        (model_image, f"U-Net\nPSNR {model_psnr:.2f}"),
+        (model_image, f"{model_label}\nPSNR {model_psnr:.2f}"),
         (sharp_image, "Sharp target"),
     ]
 
@@ -940,7 +1047,7 @@ def save_comparison_figure(
     plt.close(figure)
     return {
         "identity_psnr": identity_psnr,
-        "unet_psnr": model_psnr,
+        "model_psnr": model_psnr,
     }
 
 
@@ -951,21 +1058,23 @@ def write_benchmark_report(
     device: torch.device,
     runtime_settings: dict[str, Any],
     resume_info: Optional[dict[str, Any]],
+    evaluation_source_info: Optional[dict[str, Any]],
     split_manifest: dict[str, Any],
     model_summary: dict[str, Any],
     identity_metrics: dict[str, Any],
-    unet_metrics: dict[str, Any],
+    model_metrics: dict[str, Any],
     training_history: list[dict[str, Any]],
 ) -> None:
     train_sequences = ", ".join(split_manifest["train_sequences"])
     val_sequences = ", ".join(split_manifest["val_sequences"])
-    val_psnr_gain = unet_metrics["val"]["psnr"] - identity_metrics["val"]["psnr"]
-    val_ssim_gain = unet_metrics["val"]["ssim"] - identity_metrics["val"]["ssim"]
-    test_psnr_gain = unet_metrics["test"]["psnr"] - identity_metrics["test"]["psnr"]
-    test_ssim_gain = unet_metrics["test"]["ssim"] - identity_metrics["test"]["ssim"]
+    model_label = model_summary["name"]
+    val_psnr_gain = model_metrics["val"]["psnr"] - identity_metrics["val"]["psnr"]
+    val_ssim_gain = model_metrics["val"]["ssim"] - identity_metrics["val"]["ssim"]
+    test_psnr_gain = model_metrics["test"]["psnr"] - identity_metrics["test"]["psnr"]
+    test_ssim_gain = model_metrics["test"]["ssim"] - identity_metrics["test"]["ssim"]
 
     qualitative_lines = [
-        "- The identity baseline is already strong on GoPro, so a plain U-Net baseline needs to clear a fairly high floor."
+        "- The identity baseline is already strong on GoPro, so any single-image restoration model needs to clear a fairly high floor."
     ]
     if test_psnr_gain < 0.05:
         qualitative_lines.append(
@@ -973,11 +1082,11 @@ def write_benchmark_report(
         )
     else:
         qualitative_lines.append(
-            "- The U-Net improves over identity on both validation and test, which confirms that the paired pipeline and restoration model are working end to end."
+            f"- `{model_label}` improves over identity on both validation and test, which confirms that the paired pipeline and restoration model are working end to end."
         )
 
     issue_lines = [
-        "- This run uses a modest U-Net baseline, so model capacity and training duration are still conservative.",
+        "- This run uses a modest single-image restoration baseline, so model capacity and training duration are still conservative.",
         "- Validation is derived from only three sequences, so conclusions should be treated as directional rather than final.",
     ]
     if config.validate_each_epoch:
@@ -1010,6 +1119,18 @@ def write_benchmark_report(
                 "",
             ]
         )
+    if evaluation_source_info:
+        lines.extend(
+            [
+                "## Checkpoint Evaluation",
+                "",
+                f"- Requested checkpoint: `{evaluation_source_info['requested_checkpoint_path']}`",
+                f"- Best checkpoint evaluated: `{evaluation_source_info['best_checkpoint_path']}`",
+                f"- Latest checkpoint used for history: `{evaluation_source_info['latest_checkpoint_path']}`",
+                f"- Restored epochs in history: {evaluation_source_info['training_history_epochs']}",
+                "",
+            ]
+        )
     if resume_info and resume_info.get("enabled"):
         lines.extend(
             [
@@ -1035,10 +1156,11 @@ def write_benchmark_report(
         "",
         "## Model",
         "",
+        f"- Model key: `{config.model_name}`",
         f"- Architecture: `{model_summary['name']}`",
         f"- Trainable parameters: {model_summary['trainable_parameters']:,}",
         f"- Total parameters: {model_summary['total_parameters']:,}",
-        f"- Base channels: {config.base_channels}",
+        f"- Base channels / width: {config.base_channels}",
         f"- Device used: `{device.type}`",
         f"- AMP enabled on CUDA: {runtime_settings['amp_enabled']}",
         "",
@@ -1053,6 +1175,7 @@ def write_benchmark_report(
         f"- Prefetch factor: {runtime_settings['prefetch_factor']}",
         f"- CPU threads: {config.cpu_num_threads}",
         f"- Epochs: {config.num_epochs}",
+        *([f"- Completed epochs recorded: {len(training_history)}"] if len(training_history) != config.num_epochs else []),
         f"- Validate each epoch: {config.validate_each_epoch}",
         f"- Checkpoint monitor: {config.checkpoint_monitor}",
         f"- Optimizer: Adam",
@@ -1064,8 +1187,8 @@ def write_benchmark_report(
         "",
         f"- Identity validation: PSNR {identity_metrics['val']['psnr']:.4f}, SSIM {identity_metrics['val']['ssim']:.4f}",
         f"- Identity test: PSNR {identity_metrics['test']['psnr']:.4f}, SSIM {identity_metrics['test']['ssim']:.4f}",
-        f"- U-Net validation: PSNR {unet_metrics['val']['psnr']:.4f}, SSIM {unet_metrics['val']['ssim']:.4f}",
-        f"- U-Net test: PSNR {unet_metrics['test']['psnr']:.4f}, SSIM {unet_metrics['test']['ssim']:.4f}",
+        f"- {model_label} validation: PSNR {model_metrics['val']['psnr']:.4f}, SSIM {model_metrics['val']['ssim']:.4f}",
+        f"- {model_label} test: PSNR {model_metrics['test']['psnr']:.4f}, SSIM {model_metrics['test']['ssim']:.4f}",
         f"- Validation improvement over identity: PSNR {val_psnr_gain:+.4f}, SSIM {val_ssim_gain:+.4f}",
         f"- Test improvement over identity: PSNR {test_psnr_gain:+.4f}, SSIM {test_ssim_gain:+.4f}",
         "",
@@ -1101,6 +1224,7 @@ def write_benchmark_report(
 
 def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
     config = config or BenchmarkConfig()
+    config = replace(config, model_name=normalize_model_name(config.model_name))
     project_root = Path(__file__).resolve().parents[1]
     output_dirs = _ensure_output_dirs(project_root)
     resume_checkpoint_path = None
@@ -1193,8 +1317,9 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
 
     loss_fn = build_loss_fn(config)
     identity_model = IdentityDeblurModel().to(device)
-    unet_model = UNetDeblurModel(base_channels=config.base_channels).to(device)
-    summary = summarize_model(unet_model, name="UNetDeblurModel")
+    model = build_deblurring_model(model_name=config.model_name, base_channels=config.base_channels).to(device)
+    model_label = resolve_model_display_name(config.model_name)
+    summary = summarize_model(model, name=model_label, model_name=config.model_name)
     write_json(
         output_dirs["metrics"] / _artifact_filename(config, "model_summary.json"),
         asdict(summary),
@@ -1207,9 +1332,9 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
 
     best_checkpoint_path = output_dirs["checkpoints"] / _resolve_best_checkpoint_name(config)
     latest_checkpoint_path = output_dirs["checkpoints"] / config.latest_checkpoint_name
-    print("Training U-Net benchmark...", flush=True)
+    print(f"Training {model_label} benchmark...", flush=True)
     training_history, best_checkpoint_metric, resume_info = run_training(
-        unet_model,
+        model,
         train_loader,
         val_loader,
         device=device,
@@ -1220,19 +1345,19 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         resume_checkpoint_path=resume_checkpoint_path,
     )
 
-    load_checkpoint(best_checkpoint_path, unet_model, device)
-    print("Evaluating best U-Net on validation split...", flush=True)
-    unet_val_metrics = evaluate_model(unet_model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
-    print("Evaluating best U-Net on test split...", flush=True)
-    unet_test_metrics = evaluate_model(unet_model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+    load_checkpoint(best_checkpoint_path, model, device)
+    print(f"Evaluating best {model_label} on validation split...", flush=True)
+    model_val_metrics = evaluate_model(model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+    print(f"Evaluating best {model_label} on test split...", flush=True)
+    model_test_metrics = evaluate_model(model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
 
     comparison_examples = []
-    if unet_val_metrics.get("examples"):
-        comparison_examples.append(("val", unet_val_metrics["examples"][0]))
-        comparison_examples.append(("val", unet_val_metrics["examples"][-1]))
-    if unet_test_metrics.get("examples"):
-        comparison_examples.append(("test", unet_test_metrics["examples"][0]))
-        comparison_examples.append(("test", unet_test_metrics["examples"][-1]))
+    if model_val_metrics.get("examples"):
+        comparison_examples.append(("val", model_val_metrics["examples"][0]))
+        comparison_examples.append(("val", model_val_metrics["examples"][-1]))
+    if model_test_metrics.get("examples"):
+        comparison_examples.append(("test", model_test_metrics["examples"][0]))
+        comparison_examples.append(("test", model_test_metrics["examples"][-1]))
 
     visual_summaries = []
     for split_name, example in comparison_examples:
@@ -1244,7 +1369,8 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         visual_metrics = save_comparison_figure(
             split_name=split_name,
             example=example,
-            model=unet_model,
+            model=model,
+            model_label=model_label,
             identity_model=identity_model,
             device=device,
             output_path=output_path,
@@ -1270,17 +1396,19 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
             "val": identity_val_metrics,
             "test": identity_test_metrics,
         },
-        "unet": {
+        "model": {
             "best_checkpoint_metric": best_checkpoint_metric,
             "best_checkpoint_path": str(best_checkpoint_path),
             "latest_checkpoint_path": str(latest_checkpoint_path),
-            "val": unet_val_metrics,
-            "test": unet_test_metrics,
+            "val": model_val_metrics,
+            "test": model_test_metrics,
         },
         "training_history": training_history,
         "training_timing_summary": summarize_training_timing(training_history),
         "visual_comparisons": visual_summaries,
     }
+    if config.model_name == "unet":
+        metrics_payload["unet"] = metrics_payload["model"]
     write_json(
         output_dirs["metrics"] / _artifact_filename(config, "benchmark_metrics.json"),
         metrics_payload,
@@ -1291,15 +1419,221 @@ def run_benchmark(config: Optional[BenchmarkConfig] = None) -> dict[str, Any]:
         device=device,
         runtime_settings=runtime_settings,
         resume_info=resume_info,
+        evaluation_source_info=None,
         split_manifest=split_manifest,
         model_summary=asdict(summary),
         identity_metrics={"val": identity_val_metrics, "test": identity_test_metrics},
-        unet_metrics={"val": unet_val_metrics, "test": unet_test_metrics},
+        model_metrics={"val": model_val_metrics, "test": model_test_metrics},
         training_history=training_history,
     )
 
     print("Identity val/test:", _metric_value(identity_val_metrics, "psnr"), _metric_value(identity_test_metrics, "psnr"), flush=True)
-    print("UNet val/test:", _metric_value(unet_val_metrics, "psnr"), _metric_value(unet_test_metrics, "psnr"), flush=True)
+    print(
+        f"{model_label} val/test:",
+        _metric_value(model_val_metrics, "psnr"),
+        _metric_value(model_test_metrics, "psnr"),
+        flush=True,
+    )
+    print("Best checkpoint:", best_checkpoint_path, flush=True)
+    print("Latest checkpoint:", latest_checkpoint_path, flush=True)
+    return metrics_payload
+
+
+def run_posthoc_evaluation(checkpoint_path: str | Path) -> dict[str, Any]:
+    project_root = Path(__file__).resolve().parents[1]
+    output_dirs = _ensure_output_dirs(project_root)
+    resolved_checkpoint_path = _resolve_resume_checkpoint_path(
+        checkpoint_path,
+        project_root=project_root,
+        output_dirs=output_dirs,
+    )
+
+    checkpoint = torch.load(resolved_checkpoint_path, map_location="cpu")
+    config = _build_config_from_checkpoint(checkpoint.get("config"), checkpoint_path=resolved_checkpoint_path)
+    config = replace(config, model_name=normalize_model_name(config.model_name))
+    _validate_config(config)
+
+    seed_everything(config.seed)
+    dataset_root = find_dataset_root(config.dataset_root)
+    device = select_device()
+    runtime_settings = resolve_runtime_settings(config, device)
+    if device.type == "cpu":
+        torch.set_num_threads(config.cpu_num_threads)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(1)
+
+    split = build_sequence_split(root=dataset_root, val_fraction=config.val_fraction, seed=config.seed)
+    split_manifest = {
+        "seed": split.seed,
+        "val_fraction": split.val_fraction,
+        "dataset_root": str(dataset_root),
+        "train_sequences": split.train_sequences,
+        "val_sequences": split.val_sequences,
+        "test_sequences": split.test_sequences,
+    }
+    write_json(
+        output_dirs["metrics"] / _artifact_filename(config, "sequence_split.json"),
+        split_manifest,
+    )
+
+    val_dataset = GoProPairDataset(
+        root=dataset_root,
+        split="val",
+        mode="eval",
+        patch_size=None,
+        val_fraction=config.val_fraction,
+        seed=config.seed,
+    )
+    test_dataset = GoProPairDataset(
+        root=dataset_root,
+        split="test",
+        mode="eval",
+        patch_size=None,
+        val_fraction=config.val_fraction,
+        seed=config.seed,
+    )
+
+    val_loader = build_dataloader(
+        val_dataset,
+        batch_size=config.eval_batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=runtime_settings["num_workers"],
+        pin_memory=runtime_settings["pin_memory"],
+        persistent_workers=runtime_settings["persistent_workers"],
+        prefetch_factor=runtime_settings["prefetch_factor"],
+    )
+    test_loader = build_dataloader(
+        test_dataset,
+        batch_size=config.eval_batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=runtime_settings["num_workers"],
+        pin_memory=runtime_settings["pin_memory"],
+        persistent_workers=runtime_settings["persistent_workers"],
+        prefetch_factor=runtime_settings["prefetch_factor"],
+    )
+
+    loss_fn = build_loss_fn(config)
+    identity_model = IdentityDeblurModel().to(device)
+    model = build_deblurring_model(model_name=config.model_name, base_channels=config.base_channels).to(device)
+    model_label = resolve_model_display_name(config.model_name)
+    summary = summarize_model(model, name=model_label, model_name=config.model_name)
+    write_json(
+        output_dirs["metrics"] / _artifact_filename(config, "model_summary.json"),
+        asdict(summary),
+    )
+
+    latest_checkpoint_path = _resolve_resume_latest_checkpoint_path(resolved_checkpoint_path) or resolved_checkpoint_path
+    best_checkpoint_path = _resolve_resume_best_checkpoint_path(resolved_checkpoint_path) or resolved_checkpoint_path
+    latest_checkpoint = checkpoint if latest_checkpoint_path == resolved_checkpoint_path else torch.load(latest_checkpoint_path, map_location="cpu")
+    training_history = latest_checkpoint.get("training_history")
+    if not isinstance(training_history, list):
+        training_history = _load_history_from_metrics_artifact(latest_checkpoint_path)
+    if not isinstance(training_history, list):
+        training_history = []
+
+    print("Evaluating identity baseline on validation split...", flush=True)
+    identity_val_metrics = evaluate_model(identity_model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True)
+    print("Evaluating identity baseline on test split...", flush=True)
+    identity_test_metrics = evaluate_model(identity_model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True)
+
+    load_checkpoint(best_checkpoint_path, model, device)
+    print(f"Evaluating best {model_label} on validation split...", flush=True)
+    model_val_metrics = evaluate_model(model, val_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+    print(f"Evaluating best {model_label} on test split...", flush=True)
+    model_test_metrics = evaluate_model(model, test_loader, device=device, loss_fn=loss_fn, compute_ssim_metric=True, max_examples=4)
+
+    comparison_examples = []
+    if model_val_metrics.get("examples"):
+        comparison_examples.append(("val", model_val_metrics["examples"][0]))
+        comparison_examples.append(("val", model_val_metrics["examples"][-1]))
+    if model_test_metrics.get("examples"):
+        comparison_examples.append(("test", model_test_metrics["examples"][0]))
+        comparison_examples.append(("test", model_test_metrics["examples"][-1]))
+
+    visual_summaries = []
+    for split_name, example in comparison_examples:
+        figure_name = _artifact_filename(
+            config,
+            f"benchmark_{split_name}_{example['sequence']}_{Path(example['filename']).stem}.png",
+        )
+        output_path = output_dirs["figures"] / figure_name
+        visual_metrics = save_comparison_figure(
+            split_name=split_name,
+            example=example,
+            model=model,
+            model_label=model_label,
+            identity_model=identity_model,
+            device=device,
+            output_path=output_path,
+        )
+        visual_summaries.append(
+            {
+                "split": split_name,
+                "sequence": example["sequence"],
+                "filename": example["filename"],
+                "path": str(output_path),
+                **visual_metrics,
+            }
+        )
+
+    model_section = {
+        "best_checkpoint_metric": float(checkpoint.get("best_metric", latest_checkpoint.get("best_metric", _initial_best_metric(config.checkpoint_monitor)))),
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "latest_checkpoint_path": str(latest_checkpoint_path),
+        "val": model_val_metrics,
+        "test": model_test_metrics,
+    }
+    metrics_payload = {
+        "config": asdict(config),
+        "device": device.type,
+        "runtime": runtime_settings,
+        "resume": {"enabled": False},
+        "evaluation_source": {
+            "requested_checkpoint_path": str(resolved_checkpoint_path),
+            "best_checkpoint_path": str(best_checkpoint_path),
+            "latest_checkpoint_path": str(latest_checkpoint_path),
+            "training_history_epochs": len(training_history),
+        },
+        "split_manifest": split_manifest,
+        "model_summary": asdict(summary),
+        "identity": {
+            "val": identity_val_metrics,
+            "test": identity_test_metrics,
+        },
+        "model": model_section,
+        "training_history": training_history,
+        "training_timing_summary": summarize_training_timing(training_history),
+        "visual_comparisons": visual_summaries,
+    }
+    if config.model_name == "unet":
+        metrics_payload["unet"] = metrics_payload["model"]
+    write_json(
+        output_dirs["metrics"] / _artifact_filename(config, "benchmark_metrics.json"),
+        metrics_payload,
+    )
+    write_benchmark_report(
+        output_dirs["metrics"] / config.report_name,
+        config=config,
+        device=device,
+        runtime_settings=runtime_settings,
+        resume_info=None,
+        evaluation_source_info=metrics_payload["evaluation_source"],
+        split_manifest=split_manifest,
+        model_summary=asdict(summary),
+        identity_metrics={"val": identity_val_metrics, "test": identity_test_metrics},
+        model_metrics={"val": model_val_metrics, "test": model_test_metrics},
+        training_history=training_history,
+    )
+
+    print("Identity val/test:", _metric_value(identity_val_metrics, "psnr"), _metric_value(identity_test_metrics, "psnr"), flush=True)
+    print(
+        f"{model_label} val/test:",
+        _metric_value(model_val_metrics, "psnr"),
+        _metric_value(model_test_metrics, "psnr"),
+        flush=True,
+    )
     print("Best checkpoint:", best_checkpoint_path, flush=True)
     print("Latest checkpoint:", latest_checkpoint_path, flush=True)
     return metrics_payload

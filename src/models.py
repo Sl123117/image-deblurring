@@ -13,16 +13,24 @@ class IdentityDeblurModel(nn.Module):
         return inputs
 
 
-SUPPORTED_MODEL_NAMES = ("unet", "motion_routed_unet", "naf_style_unet")
+NAFNET_LITE_DEFAULT_WIDTH = 22
+NAFNET_LITE_ENCODER_BLOCKS = (1, 1, 1, 6)
+NAFNET_LITE_MIDDLE_BLOCKS = 1
+NAFNET_LITE_DECODER_BLOCKS = (1, 1, 1, 1)
+
+
+SUPPORTED_MODEL_NAMES = ("unet", "motion_routed_unet", "naf_style_unet", "nafnet_lite_baseline")
 MODEL_DISPLAY_NAMES = {
     "unet": "UNetDeblurModel",
     "motion_routed_unet": "MotionRoutedUNet",
     "naf_style_unet": "NAFStyleUNet",
+    "nafnet_lite_baseline": "NAFNetLiteBaseline",
 }
 MODEL_ARTIFACT_STEMS = {
     "unet": "unet_deblurring",
     "motion_routed_unet": "motion_routed_unet_deblurring",
     "naf_style_unet": "naf_style_unet_deblurring",
+    "nafnet_lite_baseline": "nafnet_lite_baseline_deblurring",
 }
 
 
@@ -137,6 +145,51 @@ class NAFStyleBlock(nn.Module):
         features = self.gate(features)
         channel_scale = torch.sigmoid(self.channel_refine(self.channel_refine_pool(features)))
         features = self.project1(features * channel_scale)
+        outputs = residual + self.beta * features
+
+        feed_forward = self.norm2(outputs)
+        feed_forward = self.expand2(feed_forward)
+        feed_forward = self.gate(feed_forward)
+        feed_forward = self.project2(feed_forward)
+        return outputs + self.gamma * feed_forward
+
+
+class NAFNetBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        expanded_channels = channels * 2
+        self.norm1 = LayerNorm2d(channels)
+        self.expand1 = nn.Conv2d(channels, expanded_channels, kernel_size=1, bias=True)
+        self.depthwise = nn.Conv2d(
+            expanded_channels,
+            expanded_channels,
+            kernel_size=3,
+            padding=1,
+            groups=expanded_channels,
+            bias=True,
+        )
+        self.gate = SimpleGate()
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+        )
+        self.project1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+        self.norm2 = LayerNorm2d(channels)
+        self.expand2 = nn.Conv2d(channels, expanded_channels, kernel_size=1, bias=True)
+        self.project2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        residual = inputs
+
+        features = self.norm1(inputs)
+        features = self.expand1(features)
+        features = self.depthwise(features)
+        features = self.gate(features)
+        features = features * self.channel_attention(features)
+        features = self.project1(features)
         outputs = residual + self.beta * features
 
         feed_forward = self.norm2(outputs)
@@ -301,6 +354,79 @@ class MotionUpBlock(nn.Module):
         return self.block(torch.cat([skip, upsampled], dim=1))
 
 
+class NAFNetLiteBaseline(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        base_channels: int = NAFNET_LITE_DEFAULT_WIDTH,
+        encoder_block_counts: Iterable[int] = NAFNET_LITE_ENCODER_BLOCKS,
+        middle_block_count: int = NAFNET_LITE_MIDDLE_BLOCKS,
+        decoder_block_counts: Iterable[int] = NAFNET_LITE_DECODER_BLOCKS,
+    ):
+        super().__init__()
+        if in_channels != out_channels:
+            raise ValueError("NAFNetLiteBaseline expects matching input and output channel counts.")
+
+        encoder_block_counts = tuple(int(count) for count in encoder_block_counts)
+        decoder_block_counts = tuple(int(count) for count in decoder_block_counts)
+        if len(encoder_block_counts) != len(decoder_block_counts):
+            raise ValueError("Encoder and decoder block counts must have the same number of stages.")
+
+        self.in_channels = in_channels
+        self.padder_size = 2 ** len(encoder_block_counts)
+        self.intro = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, bias=True)
+        self.ending = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1, bias=True)
+
+        self.encoders = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        self.middle_blocks = nn.Sequential()
+        self.ups = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+
+        channels = base_channels
+        for block_count in encoder_block_counts:
+            self.encoders.append(nn.Sequential(*(NAFNetBlock(channels) for _ in range(block_count))))
+            self.downs.append(nn.Conv2d(channels, channels * 2, kernel_size=2, stride=2, bias=True))
+            channels *= 2
+
+        self.middle_blocks = nn.Sequential(*(NAFNetBlock(channels) for _ in range(int(middle_block_count))))
+
+        for block_count in decoder_block_counts:
+            self.ups.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False),
+                    nn.PixelShuffle(2),
+                )
+            )
+            channels //= 2
+            self.decoders.append(nn.Sequential(*(NAFNetBlock(channels) for _ in range(block_count))))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        original_height, original_width = inputs.shape[2:]
+        pad_height = (self.padder_size - original_height % self.padder_size) % self.padder_size
+        pad_width = (self.padder_size - original_width % self.padder_size) % self.padder_size
+        padded_inputs = F.pad(inputs, (0, pad_width, 0, pad_height))
+
+        features = self.intro(padded_inputs)
+        skips: list[torch.Tensor] = []
+
+        for encoder, downsample in zip(self.encoders, self.downs):
+            features = encoder(features)
+            skips.append(features)
+            features = downsample(features)
+
+        features = self.middle_blocks(features)
+
+        for upsample, decoder, skip in zip(self.ups, self.decoders, reversed(skips)):
+            features = upsample(features)
+            features = decoder(features + skip)
+
+        residual = self.ending(features)
+        outputs = torch.clamp(padded_inputs + residual, 0.0, 1.0)
+        return outputs[:, :, :original_height, :original_width]
+
+
 class UNetDeblurModel(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_channels: int = 16):
         super().__init__()
@@ -438,6 +564,12 @@ def build_deblurring_model(
             out_channels=out_channels,
             base_channels=base_channels,
         )
+    if normalized_model_name == "nafnet_lite_baseline":
+        return NAFNetLiteBaseline(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=base_channels,
+        )
     return MotionRoutedUNet(
         in_channels=in_channels,
         out_channels=out_channels,
@@ -472,6 +604,12 @@ __all__ = [
     "MODEL_DISPLAY_NAMES",
     "SUPPORTED_MODEL_NAMES",
     "LayerNorm2d",
+    "NAFNetBlock",
+    "NAFNetLiteBaseline",
+    "NAFNET_LITE_DECODER_BLOCKS",
+    "NAFNET_LITE_DEFAULT_WIDTH",
+    "NAFNET_LITE_ENCODER_BLOCKS",
+    "NAFNET_LITE_MIDDLE_BLOCKS",
     "NAFStyleBlock",
     "NAFStyleUNet",
     "MotionRoutedUNet",
